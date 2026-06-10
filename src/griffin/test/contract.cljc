@@ -44,7 +44,68 @@
      `p/next-state (fn [_this] next-state)
      `p/gen (fn [_this] (if gen
                           gen
-                          (s/gen spec)))}))
+                          (s/gen spec)))
+     `p/outcome (constantly :return)}))
+
+(defn throws
+  "Define a thrown outcome for a model method. Like `return`, but declares
+  that the method throws rather than returning a value.
+
+  ex-spec - a spec or predicate used for validating the exception thrown by
+  the implementation. See `ex-spec` for the common case of validating an
+  ex-info by its ex-data.
+  next-state - the model's next state
+  gen - a generator constructing exceptions for mocks to throw. If not
+  specified, `ex-spec` must gen.
+
+  The model method fn must stay pure: whether a call throws must be a
+  function of (state, args) only. Model nondeterministic faults (\"this call
+  may time out\") as explicit model state, e.g. a fault flag or queue."
+  [ex-spec & {:keys [next-state gen]}]
+  (validate! identity ex-spec)
+  (validate! (s/nilable gen/generator?) gen)
+
+  (with-meta
+    {:spec ex-spec
+     :next-state next-state
+     :gen gen}
+    {`p/spec (fn [_this] ex-spec)
+     `p/next-state (fn [_this] next-state)
+     `p/gen (fn [_this] (if gen
+                          gen
+                          (s/gen ex-spec)))
+     `p/outcome (constantly :throw)}))
+
+(defn outcome
+  "Return the outcome of a Return value, :return or :throw. Returns that
+  predate `p/outcome` are treated as :return."
+  [ret]
+  (try
+    (p/outcome ret)
+    (catch #?(:clj Throwable :cljs :default) _
+      :return)))
+
+(defn ex-spec
+  "Returns a spec matching an ex-info whose ex-data conforms to `data-spec`.
+  Gens by generating data from `data-spec`, so it can be passed to `throws`
+  without an explicit :gen."
+  [data-spec]
+  (s/with-gen
+    (s/and #(instance? #?(:clj clojure.lang.ExceptionInfo
+                          :cljs cljs.core/ExceptionInfo) %)
+           #(s/valid? data-spec (ex-data %)))
+    (fn []
+      (gen/fmap (fn [data] (ex-info "mock error" data))
+                (s/gen data-spec)))))
+
+(defn- invoke-outcome
+  "Call f with args, capturing the outcome as data: {:outcome :return
+  :value v} or {:outcome :throw :value exception}."
+  [f & args]
+  (try
+    {:outcome :return :value (apply f args)}
+    (catch #?(:clj Throwable :cljs :default) t
+      {:outcome :throw :value t})))
 
 (defn return? [x]
   (or (satisfies? p/Return x)
@@ -151,9 +212,15 @@
                                                                          (gen/generate (p/gen ret)))]
                                                          (s/assert ret-spec ret-value)
                                                          ;; HACK
-                                                         (reset! *ret-value ret-value)
+                                                         (reset! *ret-value {:outcome (outcome ret)
+                                                                             :value ret-value})
                                                          (p/next-state ret))))
-                         @*ret-value))])))
+                         ;; throw outside swap-state: its fn may be retried
+                         ;; and must stay side-effect free
+                         (let [{:keys [outcome value]} @*ret-value]
+                           (if (= :throw outcome)
+                             (throw value)
+                             value))))])))
          (into {}))))
 
 (defn model? [x]
@@ -312,20 +379,26 @@
                     (every? (fn [call]
                               (swap! executed-calls conj call)
                               (let [{:keys [method args return]} call
-                                    impl-ret (apply (p/var method) impl args)
+                                    actual (apply invoke-outcome (p/var method) impl args)
+                                    expected-outcome (outcome return)
                                     ret (and return
                                              (p/spec return)
                                              (s/spec (p/spec return))
-                                             (s/valid? (p/spec return) impl-ret))]
+                                             (= expected-outcome (:outcome actual))
+                                             (s/valid? (p/spec return) (:value actual)))]
                                 (when-not ret
                                   (prn {:fail method
                                         :args args
                                         :expected (p/spec return)
-                                        :actual impl-ret
-                                        :explain (s/explain-data (p/spec return) impl-ret)}))
+                                        :expected-outcome expected-outcome
+                                        :actual (:value actual)
+                                        :actual-outcome (:outcome actual)
+                                        :explain (s/explain-data (p/spec return) (:value actual))}))
                                 (swap! executed-calls
                                        (fn [calls call] (-> calls pop (conj call)))
-                                       (assoc call :implementation-return impl-ret))
+                                       (assoc call
+                                              :implementation-return (:value actual)
+                                              :implementation-outcome (:outcome actual)))
                                 ret)) calls)
                     (finally
                       (p/cleanup model impl @executed-calls))))))
@@ -361,13 +434,24 @@
                                                        (reset! *ret ret)
                                                        (p/next-state ret))))
                             (let [ret-spec (p/spec @*ret)
-                                  impl-ret (apply v impl args)]
-                              (when (not (s/valid? ret-spec impl-ret))
+                                  expected-outcome (outcome @*ret)
+                                  actual (apply invoke-outcome v impl args)]
+                              (when (or (not= expected-outcome (:outcome actual))
+                                        (not (s/valid? ret-spec (:value actual))))
                                 (throw (ex-info
                                         "implementation did not conform to spec" {:model-ret @*ret
-                                                                                  :impl-ret impl-ret
-                                                                                  :explain (s/explain-data ret-spec impl-ret)})))
+                                                                                  :expected-outcome expected-outcome
+                                                                                  :impl-ret (:value actual)
+                                                                                  :impl-outcome (:outcome actual)
+                                                                                  :explain (s/explain-data ret-spec (:value actual))}
+                                        (when (= :throw (:outcome actual))
+                                          (:value actual)))))
                               (if (= :implementation return)
-                                impl-ret
-                                (nth (gen/sample (p/gen @*ret)) (rand-int 10))))))])))
+                                (if (= :throw (:outcome actual))
+                                  (throw (:value actual))
+                                  (:value actual))
+                                (let [model-val (nth (gen/sample (p/gen @*ret)) (rand-int 10))]
+                                  (if (= :throw expected-outcome)
+                                    (throw model-val)
+                                    model-val))))))])))
             (into {}))))))
