@@ -4,11 +4,16 @@
 (defprotocol Return
   :extend-via-metadata true
   (spec [this]
-    "A spec to validate the implementation's return value against")
+    "A spec to validate the implementation's outcome against. For `:return`
+    outcomes this is applied to the return value, for `:throw` outcomes to
+    the thrown exception")
   (next-state [this]
     "The next state value after this method returns")
   (gen [this]
-    "A generator for mock return values. If not supplied, `spec` must gen"))
+    "A generator for mock return values. If not supplied, `spec` must gen")
+  (outcome [this]
+    "Either :return (the method returns a value) or :throw (the method
+    throws). Implementations that do not supply this are treated as :return"))
 
 (defprotocol Method
   :extend-via-metadata true

@@ -44,9 +44,9 @@ Define a model of the protocol:
                #'create-file
                (fn [state [file]]
                  (if (not (get-in state [:files file]))
-                   (c/return (gs/constant :ok)
+                   (c/return #{:ok}
                             :next-state (update state :files conj file))
-                   (c/return (gs/constant :error/file-exists)
+                   (c/return #{:error/file-exists}
                             :next-state state)))
                :args (fn [_state] (gen/tuple gen/string)))]
     :initial-state (fn [] {:files #{}})}))
@@ -134,9 +134,53 @@ The corollary here is that the model must not close over any state which mutates
 
 
 
-# Injecting Errors
+# Errors
 
-Coming Soon
+Real implementations often throw: timeouts, connection errors, corrupted filesystem reads. A method call therefore has an _outcome_: either a normal return value or a thrown exception. `c/return` declares the former; `c/throws` declares the latter:
+
+```clojure
+(c/throws ex-spec :next-state state)
+```
+
+`ex-spec` is a spec or predicate validated against the thrown exception object. `c/ex-spec` covers the common case of an `ex-info` whose `ex-data` conforms to a spec, and generates conforming exceptions for mocks:
+
+```clojure
+(s/def ::error #{:error/timeout :error/conn-reset})
+
+(c/method #'create-file
+          (fn [state [file]]
+            (cond
+              (:network-down? state)
+              (c/throws (c/ex-spec (s/keys :req [::error]))
+                        :next-state state)
+
+              (not (get-in state [:files file]))
+              (c/return #{:ok}
+                        :next-state (update state :files conj file))
+
+              :else
+              (c/return #{:error/file-exists}
+                        :next-state state)))
+          :args (fn [_state] (gen/tuple gen/string)))
+```
+
+- `verify` catches `Exception`s thrown by the implementation (JVM `Error`s such as `OutOfMemoryError` propagate). The call conforms when the model declared `c/throws` and the exception matches `ex-spec`; an undeclared throw, or a normal return where a throw was declared, fails the property and shrinks like any other failure.
+- `mock` generates a conforming exception (from `:gen` or `ex-spec`'s generator) and throws it. With `:seed`, injected faults are deterministic.
+- `test-proxy` rethrows the implementation's exception when the model declared `c/throws` and the exception conforms. When the model expected a value but the implementation threw, the original exception propagates unchanged. It throws "implementation did not conform to spec" (with the offending exception as the cause) when the implementation returns where a throw was declared, returns a non-conforming value, or throws an exception that does not match the declared `ex-spec`.
+
+## Injecting Errors
+
+Whether a call throws must be a pure function of `(state, args)` — the same invariant the model already imposes on `next-state`, and what makes shrinking work. To model nondeterministic faults ("this call may time out"), reify the fault as explicit model state — a flag or a queue of scheduled faults — toggled by ordinary model methods:
+
+```clojure
+(c/method #'break-network
+          (fn [state _args]
+            (c/return #{:ok}
+                      :next-state (assoc state :network-down? true)))
+          :args (fn [_state] (gen/return [])))
+```
+
+Generated call sequences will then deterministically explore faulty interleavings, and shrinking will find the minimal sequence of calls — including the fault injections — that reproduces a failure.
 
 # Cleaning up
 
