@@ -214,33 +214,117 @@
     (gen/such-that (fn [args] (p/precondition method state args))
                    gen-args)))
 
+;; --- Swarm testing (Groce et al., ISSTA 2012) ---
+;;
+;; With uniform method selection, every generated sequence draws from the full
+;; set of methods, so "interesting" sequences (e.g. many `set`s in a row with no
+;; `get`/`delete`) are vanishingly unlikely. Swarm testing instead picks a random
+;; *subset* ("config") of the model's methods once per sequence and generates the
+;; whole sequence from only that subset. The diversity - especially the omission
+;; of methods in some runs - surfaces bugs uniform generation effectively never
+;; reaches.
+
+(def default-swarm-opts
+  "Default swarm options. See `gen-swarm-config`."
+  {:probability 0.5 :min-size 1 :always #{}})
+
+(defn resolve-swarm-opts
+  "Normalize the `:swarm` option into an options map, or nil when swarm is off.
+  Accepts nil/false (off), true (defaults), or a (partial) options map."
+  [swarm]
+  (cond
+    (or (nil? swarm) (false? swarm)) nil
+    (true? swarm) default-swarm-opts
+    (map? swarm) (merge default-swarm-opts swarm)
+    :else (throw (#?(:clj ex-info :cljs ex-info)
+                  ":swarm must be true, false, nil, or a map of options"
+                  {:swarm swarm}))))
+
+(defn- gen-include?
+  "A generator of a boolean that is true with probability `p`. Safe at the
+  extremes p<=0 and p>=1 (where `gen/frequency` would otherwise reject a zero
+  weight)."
+  [p]
+  (cond
+    (<= p 0) (gen/return false)
+    (>= p 1) (gen/return true)
+    :else (gen/frequency [[(int (* 1000 p)) (gen/return true)]
+                          [(int (* 1000 (- 1 p))) (gen/return false)]])))
+
+(defn gen-swarm-config
+  "Return a generator of a swarm config: a non-empty set of method vars drawn
+  from the model's methods. Each method is independently included with
+  probability `:probability`; method vars in `:always` are always included; and
+  the result is topped up deterministically to at least `:min-size` methods.
+
+  The config is drawn once per call sequence (see `gen-calls`)."
+  [model swarm-opts]
+  (let [{:keys [probability min-size always]} (merge default-swarm-opts swarm-opts)
+        all-vars (mapv p/var (p/methods model))
+        always (set always)
+        optional (vec (remove always all-vars))
+        min-size (max 1 (min min-size (count all-vars)))]
+    (gen/fmap
+     (fn [flags]
+       (let [picked (into always
+                          (keep-indexed (fn [i v] (when (nth flags i) v)) optional))]
+         ;; top up to :min-size from the not-yet-picked methods
+         (loop [s picked
+                pool (remove s optional)]
+           (if (or (>= (count s) min-size) (empty? pool))
+             s
+             (recur (conj s (first pool)) (rest pool))))))
+     (if (seq optional)
+       (apply gen/tuple (map (fn [_] (gen-include? probability)) optional))
+       (gen/return [])))))
+
+(defn swarm-gen-method
+  "Like `default-gen-method`, but only selects from methods whose var is in
+  `config` (a set of method vars). If no method in `config` passes `requires`
+  for the current `state`, falls back to the full set of valid methods, so
+  generation never deadlocks. Preserves the existing `requires` invariant: it
+  only asserts when *no* method is valid (a genuine model bug, swarm or not)."
+  [model config state]
+  (let [valid (->> (p/methods model)
+                   (filter (fn [m] (p/requires m state))))
+        in-config (filter (fn [m] (contains? config (p/var m))) valid)]
+    (assert (seq valid) (print-str "At least one command must pass :requires with state: " (prn-str state)))
+    (gen/elements (if (seq in-config) in-config valid))))
+
 (defn gen-call
-  "return a generator for a single call to the model"
-  [model state]
-  (gen/bind (p/gen-method model state)
-            (fn [method]
-              (gen/fmap (fn [args]
-                          {:method method
-                           :args args
-                           :return (p/return method state args)}) (gen-valid-args state method)))))
+  "return a generator for a single call to the model.
+
+  `config`, when non-nil, is a swarm config (a set of method vars) that
+  restricts which method may be selected for this call."
+  ([model state] (gen-call model state nil))
+  ([model state config]
+   (gen/bind (if config
+               (swarm-gen-method model config state)
+               (p/gen-method model state))
+             (fn [method]
+               (gen/fmap (fn [args]
+                           {:method method
+                            :args args
+                            :return (p/return method state args)}) (gen-valid-args state method))))))
 
 (defn gen-calls-
   "Given a model instance, return a sequence of maps containing
   `:method`, `:arguments` and the model's expected return
   spec. Satisfies valid-call-sequence?, but does not shrink properly"
-  [model state length]
-  (validate! nat-int? length)
-  (if (pos? length)
-    (gen/gen-bind
-      (gen-call model state)
-      (fn [call-rose]
-        (let [{:keys [return]} (rose/root call-rose)]
-          (assert (return? return))
-          (let [next-state (p/next-state return)]
-            (gen/gen-fmap (fn [rest-calls]
-                            (into [call-rose] rest-calls))
-                          (gen-calls- model next-state (dec length)))))))
-    (gen/gen-pure [])))
+  ([model state length] (gen-calls- model state length nil))
+  ([model state length config]
+   (validate! nat-int? length)
+   (if (pos? length)
+     (gen/gen-bind
+       (gen-call model state config)
+       (fn [call-rose]
+         (let [{:keys [return]} (rose/root call-rose)]
+           (assert (return? return))
+           (let [next-state (p/next-state return)]
+             (gen/gen-fmap (fn [rest-calls]
+                             (into [call-rose] rest-calls))
+                           (gen-calls- model next-state (dec length) config))))))
+     (gen/gen-pure []))))
 
 (defn recompute-state
   "Given a seq of calls that has been modified, recompute state. Returns the calls or nil if a precondition failed"
@@ -260,32 +344,51 @@
        :calls))
 
 (defn gen-calls
-  "Generate a seq of calls that shrinks properly"
-  [model state & {:keys [max-length]
-                  :or {max-length 10}}]
-  (gen/bind (gen/large-integer* {:min 1 :max max-length})
-            (fn [n]
-              (gen/gen-fmap (fn [rose-calls]
-                              ;; http://blog.guillermowinkler.com/blog/2015/04/12/verifying-state-machine-behavior-using-test-dot-check/
-                              ;; A rose tree holds a 'real' value at the root, with children being
-                              ;; possible shrinks. Normal vectors shrink both by shrinking each
-                              ;; item and by removing items (one at a time or half at once)
-                              ;; We lazily recompute the state for each potential shrunk vector
-                              ;; of calls, and remove any that are not valid (which also removes
-                              ;; all its children), to guarantee test.check only picks valid ones.
+  "Generate a seq of calls that shrinks properly.
 
-                              (->> (rose/shrink-vector vector rose-calls)
-                                   (rose/fmap #(recompute-state model %))
-                                   (rose/filter some?)))
-                            (gen-calls- model state n)))))
+  Options:
+  max-length - maximum number of calls to generate (default 10)
+  swarm - enable swarm testing. nil/false (default, off), true (defaults), or a
+          map of options (see `gen-swarm-config`). When enabled, a random subset
+          of the model's methods is chosen once per sequence and the whole
+          sequence is generated from only that subset."
+  [model state & {:keys [max-length swarm]
+                  :or {max-length 10}}]
+  (let [swarm-opts (resolve-swarm-opts swarm)
+        config-gen (if swarm-opts
+                     (gen-swarm-config model swarm-opts)
+                     (gen/return nil))]
+    (gen/bind
+     config-gen
+     (fn [config]
+       ;; the swarm config is bound once here, so it is fixed for the whole
+       ;; generated sequence (and does not shrink - shrinking only removes or
+       ;; simplifies the calls already drawn from the config).
+       (gen/bind (gen/large-integer* {:min 1 :max max-length})
+                 (fn [n]
+                   (gen/gen-fmap (fn [rose-calls]
+                                   ;; http://blog.guillermowinkler.com/blog/2015/04/12/verifying-state-machine-behavior-using-test-dot-check/
+                                   ;; A rose tree holds a 'real' value at the root, with children being
+                                   ;; possible shrinks. Normal vectors shrink both by shrinking each
+                                   ;; item and by removing items (one at a time or half at once)
+                                   ;; We lazily recompute the state for each potential shrunk vector
+                                   ;; of calls, and remove any that are not valid (which also removes
+                                   ;; all its children), to guarantee test.check only picks valid ones.
+
+                                   (->> (rose/shrink-vector vector rose-calls)
+                                        (rose/fmap #(recompute-state model %))
+                                        (rose/filter some?)))
+                                 (gen-calls- model state n config))))))))
 
 (defn test-model
-  "Defines a property checking the model. Put it in a defspec"
-  [model]
+  "Defines a property checking the model. Put it in a defspec.
+
+  swarm - enable swarm testing (see `gen-calls`). Defaults to off."
+  [model & {:keys [swarm]}]
   (validate! ::model model)
   (validate! ::methods (p/methods model))
 
-  (prop/for-all [calls (gen-calls model (p/initial-state model))]
+  (prop/for-all [calls (gen-calls model (p/initial-state model) :swarm swarm)]
                 (->> calls
                      (every? (fn [c]
                                (and c
@@ -300,12 +403,14 @@
 
   num-calls: maximum call length to generate in a single run
 
+  swarm: enable swarm testing (see `gen-calls`). Defaults to off.
+
   Tests the implementation against a sequence of calls from the model
   "
-  [model impl-f & {:keys [num-calls]
+  [model impl-f & {:keys [num-calls swarm]
                    :or {num-calls 10}
                    :as _opts}]
-  (prop/for-all [calls (gen-calls model (p/initial-state model) :max-length num-calls)]
+  (prop/for-all [calls (gen-calls model (p/initial-state model) :max-length num-calls :swarm swarm)]
                 (let [impl (impl-f)
                       executed-calls (atom [])]
                   (try

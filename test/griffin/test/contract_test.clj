@@ -184,7 +184,153 @@
                                        {:files #{}})})]
 
   (deftest broken-model-test
+    ;; Use enough iterations that generation reliably selects the method with
+    ;; the broken :args; with `quick-check 1` the test was flaky because a
+    ;; single short run may never exercise file-exists?.
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo
          #":args must return a generator for*"
-         (tc/quick-check 1 (c/test-model broken-model))))))
+         (tc/quick-check 100 (c/test-model broken-model))))))
+
+;; ---- Swarm testing ----
+
+(deftest swarm-opts-resolution
+  (is (nil? (c/resolve-swarm-opts nil)) "nil -> off")
+  (is (nil? (c/resolve-swarm-opts false)) "false -> off")
+  (is (= c/default-swarm-opts (c/resolve-swarm-opts true)) "true -> defaults")
+  (is (= 0.1 (:probability (c/resolve-swarm-opts {:probability 0.1}))) "map override")
+  (is (= 1 (:min-size (c/resolve-swarm-opts {:probability 0.1}))) "map merges defaults")
+  (is (thrown? Exception (c/resolve-swarm-opts 5)) "invalid -> throws"))
+
+(deftest swarm-config-properties
+  (doseq [opts [{} {:probability 0.0} {:probability 1.0} {:min-size 2} {:min-size 3}
+                {:min-size 99} {:probability 0.0 :always #{#'create-file}}]]
+    (testing opts
+      (let [configs  (gen/sample (c/gen-swarm-config model opts) 100)
+            all-vars (set (map p/var (p/methods model)))
+            min-size (max 1 (min (get opts :min-size 1) (count all-vars)))
+            always   (set (:always opts))]
+        (doseq [cfg configs]
+          (is (set? cfg) "config is a set")
+          (is (seq cfg) "config is non-empty")
+          (is (every? all-vars cfg) "config is a subset of the model's method vars")
+          (is (>= (count cfg) min-size) "config respects :min-size")
+          (is (every? cfg always) "config includes every :always method"))))))
+
+(deftest swarm-verify-works
+  (is (:pass? (tc/quick-check 100 (c/verify model good-impl :swarm true)))))
+
+(deftest swarm-verify-catches-errors
+  (let [ret (tc/quick-check 100 (c/verify model bad-impl :swarm true))]
+    (is (false? (:pass? ret)) ret)))
+
+(deftest swarm-off-works-like-default
+  (is (:pass? (tc/quick-check 50 (c/verify model good-impl :swarm false))))
+  (is (:pass? (tc/quick-check 50 (c/verify model good-impl :swarm nil)))))
+
+(deftest swarm-produces-homogeneous-runs
+  ;; With a forced single-method config, every generated sequence is composed
+  ;; entirely of that one method - long single-method runs that uniform
+  ;; generation effectively never produces (this is the whole point of swarm).
+  (let [seqs (gen/sample (c/gen-calls model (p/initial-state model)
+                                      :max-length 12
+                                      :swarm {:always #{#'create-file} :probability 0.0})
+                         100)]
+    (is (every? (fn [calls]
+                  (every? #(= #'create-file (p/var (:method %))) calls))
+                seqs)
+        "every swarm call sequence uses only create-file")
+    (is (some #(>= (count %) 6) seqs)
+        "swarm produces long single-method runs"))
+  ;; Uniform generation mixes methods: at least one sequence uses >1 distinct method.
+  (let [seqs (gen/sample (c/gen-calls model (p/initial-state model) :max-length 12)
+                         100)]
+    (is (some (fn [calls]
+                (> (count (distinct (map #(p/var (:method %)) calls))) 1))
+              seqs)
+        "uniform generation mixes multiple methods")))
+
+(deftest swarm-fallback-avoids-deadlock
+  ;; A config of only delete-file (which is invalid in the initial state, since
+  ;; :requires needs a non-empty :files) must not deadlock generation:
+  ;; swarm-gen-method falls back to a valid method to make progress, then uses
+  ;; delete-file once it becomes valid. Generation completing (no throw) and
+  ;; every sequence being valid proves the hazard is handled.
+  (let [seqs (gen/sample (c/gen-calls model (p/initial-state model)
+                                      :max-length 10
+                                      :swarm {:always #{#'delete-file} :probability 0.0})
+                         50)]
+    (is (seq seqs))
+    (doseq [calls seqs]
+      (reduce (fn [state {:keys [method args]}]
+                (is (p/requires method state) "fallback obeys requires")
+                (is (p/precondition method state args) "fallback obeys preconditions")
+                (p/next-state (p/return method state args)))
+              (p/initial-state model)
+              calls))))
+
+(deftest swarm-shrinking-produces-valid-calls
+  ;; Same invariant as shrinking-produces-valid-calls, but with swarm enabled:
+  ;; shrinking still only produces valid call sequences (recompute-state is
+  ;; unaffected by the swarm config).
+  (->> (rose/seq (gen/call-gen (c/gen-calls model (p/initial-state model) :swarm true)
+                               (random/make-random 42) 100))
+       (take 1000)
+       (run! (fn [calls]
+               (reduce (fn [state {:keys [method args return]}]
+                         (is (p/requires method state) "shrunk state obeys requires")
+                         (is (p/precondition method state args) "shrunk state obeys preconditions")
+                         (let [state' (p/next-state (p/return method state args))]
+                           (is (= state' (p/next-state return)) "shrunk state is correct")
+                           state'))
+                       (p/initial-state model)
+                       calls)))))
+
+;; A protocol with a bug that only manifests after several consecutive
+;; cache-set calls with no intervening cache-get - the canonical example of a
+;; bug uniform random generation misses but swarm reliably finds.
+
+(defprotocol Cache
+  :extend-via-metadata true
+  (cache-set [this k v])
+  (cache-get [this k]))
+
+(def cache-model
+  (c/model
+   {:protocols #{Cache}
+    :methods [(c/method #'cache-set
+                        (fn [state [k v]]
+                          (c/return #{:ok}
+                                    :next-state (assoc-in state [:cache k] v)))
+                        :args (fn [_state] (gen/tuple gen/keyword gen/nat)))
+              (c/method #'cache-get
+                        (fn [state [_k]]
+                          (c/return #{:ok}
+                                    :next-state state))
+                        :args (fn [_state] (gen/tuple gen/keyword)))]
+    :initial-state (fn [] {:cache {}})}))
+
+(defn buggy-cache
+  "Returns :ok normally, but breaks (returns :error) after more than 3
+  consecutive cache-set calls with no intervening cache-get."
+  []
+  (let [consecutive (atom 0)]
+    (reify Cache
+      (cache-set [_ _ _]
+        (if (> (swap! consecutive inc) 3)
+          :error
+          :ok))
+      (cache-get [_ _]
+        (reset! consecutive 0)
+        :ok))))
+
+(deftest swarm-catches-consecutive-call-bug
+  ;; Swarm isolates cache-set into long runs and reliably triggers the bug.
+  (let [ret (tc/quick-check 100
+                            (c/verify cache-model buggy-cache
+                                      :num-calls 12
+                                      :swarm {:always #{#'cache-set} :probability 0.0}))]
+    (is (false? (:pass? ret)) ret)
+    ;; the minimal failing case is 4 consecutive cache-set calls
+    (is (= 4 (count (first (:smallest (:shrunk ret)))))
+        (:shrunk ret))))

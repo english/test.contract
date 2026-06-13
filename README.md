@@ -130,6 +130,33 @@ When we shrink, we are effectively "rewinding" state. The call to `(create 2)` m
 
 The corollary here is that the model must not close over any state which mutates during a test.
 
+# Swarm Testing
+
+By default, each generated call sequence draws from *all* of the model's methods with uniform probability. This means "interesting" sequences are vanishingly unlikely: in a cache modeled with `set`/`get`/`delete`, a run of ten `set`s in a row (which might trigger an eviction bug) essentially never occurs, because `get` and `delete` keep getting mixed in.
+
+Swarm testing ([Groce et al., ISSTA 2012](https://agroce.github.io/issta12.pdf)) addresses this. When enabled, a random *subset* ("config") of the model's methods is chosen once per call sequence, and the whole sequence is generated from only that subset. Because some methods are omitted entirely in any given run, you get long runs of the remaining methods - exactly the sequences uniform generation misses.
+
+Enable it by passing `:swarm` to `verify` (or `test-model`):
+
+```clojure
+(c/verify model ->RealRemoteAPIClient :swarm true)
+```
+
+`:swarm` accepts `true` (defaults), `false`/`nil` (off, the default), or a map of options:
+
+```clojure
+(c/verify model ->RealRemoteAPIClient
+          :swarm {:probability 0.5        ; per-method inclusion probability (default 0.5)
+                  :min-size    1          ; minimum methods per config (default 1)
+                  :always      #{#'create-file}}) ; method vars always included (default #{})
+```
+
+- `:probability` - lower values produce smaller configs and longer single-method runs.
+- `:min-size` - a floor on config size (clamped to the number of methods).
+- `:always` - method vars that appear in every config. Useful for a "constructor" method (e.g. `create-file`) that other methods depend on via `:requires`.
+
+If a chosen config excludes every method that is valid (per `:requires`) in some reachable state, generation falls back to the full set of valid methods for that step, so swarm never deadlocks. Swarm only affects generation; shrinking is unaffected and still produces minimal, valid counterexamples.
+
 # Limitations
 
 
