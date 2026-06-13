@@ -202,37 +202,40 @@
   (break-network [this])
   (fix-network [this]))
 
+(defn network-error
+  "A throws-outcome for a method that fails while the network is down."
+  [state]
+  (c/throws (c/ex-spec (s/keys :req [::error]))
+            :next-state state))
+
 (def fault-model
   (c/model
    {:protocols #{FlakyStore}
     :methods [(c/method #'put-item
                         (fn [state [k]]
                           (if (:network-down? state)
-                            (c/throws (c/ex-spec (s/keys :req [::error]))
-                                      :next-state state)
+                            (network-error state)
                             (c/return #{:ok}
                                       :next-state (update state :items conj k))))
                         :args (fn [_state] (gen/tuple gen/string)))
               (c/method #'has-item?
                         (fn [state [k]]
                           (if (:network-down? state)
-                            (c/throws (c/ex-spec (s/keys :req [::error]))
-                                      :next-state state)
+                            (network-error state)
                             (let [exists? (contains? (:items state) k)]
                               (c/return (s/with-gen (fn [x] (= exists? x))
                                           (fn [] (gen/return exists?)))
                                         :next-state state))))
                         :args (fn [_state] (gen/tuple gen/string)))
+              ;; no :args: exercises the optional-args default of (gen/return [])
               (c/method #'break-network
                         (fn [state _args]
                           (c/return #{:ok}
-                                    :next-state (assoc state :network-down? true)))
-                        :args (fn [_state] (gen/return [])))
+                                    :next-state (assoc state :network-down? true))))
               (c/method #'fix-network
                         (fn [state _args]
                           (c/return #{:ok}
-                                    :next-state (assoc state :network-down? false)))
-                        :args (fn [_state] (gen/return [])))]
+                                    :next-state (assoc state :network-down? false))))]
     :initial-state (fn []
                      {:items #{}
                       :network-down? false})}))
@@ -292,6 +295,12 @@
 (deftest fault-model-works
   (is (:pass? (tc/quick-check 100 (c/test-model fault-model)))))
 
+(deftest method-args-is-optional
+  ;; break-network/fix-network omit :args; the mock supplies no args to them
+  (let [mock (c/mock fault-model)]
+    (is (= :ok (break-network mock)))
+    (is (= :ok (fix-network mock)))))
+
 (deftest mocks-throw-declared-errors
   (let [mock (c/mock fault-model)]
     (is (= :ok (put-item mock "hello")))
@@ -344,11 +353,18 @@
       (is (= :return (:impl-outcome (ex-data e))))))
 
   (let [proxy (c/test-proxy fault-model (undeclared-throw-impl))]
-    ;; impl threw where model expected a value; original exception is the cause
+    ;; impl threw where the model expected a value: the original exception
+    ;; propagates unchanged (test-proxy does not wrap undeclared throws, so
+    ;; callers that caught specific exception types keep working)
     (let [e (try (put-item proxy "hello") (catch Exception e e))]
-      (is (= "implementation did not conform to spec" (ex-message e)))
-      (is (= :throw (:impl-outcome (ex-data e))))
-      (is (= {:cause :disk} (ex-data (ex-cause e)))))))
+      (is (= "corrupted read" (ex-message e)))
+      (is (= {:cause :disk} (ex-data e))))))
+
+(deftest test-proxy-validates-return-option
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"value does not conform"
+       (c/test-proxy fault-model (good-flaky-impl) :return :impl))))
 
 (deftest test-proxy-model-return-throws
   (let [proxy (c/test-proxy fault-model (good-flaky-impl) :return :model)]

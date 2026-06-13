@@ -24,18 +24,11 @@
   ([spec x]
    (validate! spec x "value does not conform!")))
 
-(defn return
-  "Define a return value for a model method. Model methods must always return an instance of `return`.
-
-  spec - a spec or predicate used for validating the implementation's return value
-  next state - the model's next state
-  gen - A generator used to construct mock return value. If not specified, `spec` must gen
-  "
-  [spec & {:keys [next-state gen]}]
-
-  (validate! identity spec)
-  (validate! (s/nilable gen/generator?) gen)
-
+(defn- ->return
+  "Shared builder for `return` and `throws`. outcome-kind is :return or
+  :throw; spec validates the returned value or the thrown exception
+  respectively."
+  [outcome-kind spec next-state gen]
   (with-meta
     {:spec spec
      :next-state next-state
@@ -45,7 +38,19 @@
      `p/gen (fn [_this] (if gen
                           gen
                           (s/gen spec)))
-     `p/outcome (constantly :return)}))
+     `p/outcome (constantly outcome-kind)}))
+
+(defn return
+  "Define a return value for a model method. Model methods must always return an instance of `return`.
+
+  spec - a spec or predicate used for validating the implementation's return value
+  next state - the model's next state
+  gen - A generator used to construct mock return value. If not specified, `spec` must gen
+  "
+  [spec & {:keys [next-state gen]}]
+  (validate! identity spec)
+  (validate! (s/nilable gen/generator?) gen)
+  (->return :return spec next-state gen))
 
 (defn throws
   "Define a thrown outcome for a model method. Like `return`, but declares
@@ -64,26 +69,18 @@
   [ex-spec & {:keys [next-state gen]}]
   (validate! identity ex-spec)
   (validate! (s/nilable gen/generator?) gen)
-
-  (with-meta
-    {:spec ex-spec
-     :next-state next-state
-     :gen gen}
-    {`p/spec (fn [_this] ex-spec)
-     `p/next-state (fn [_this] next-state)
-     `p/gen (fn [_this] (if gen
-                          gen
-                          (s/gen ex-spec)))
-     `p/outcome (constantly :throw)}))
+  (->return :throw ex-spec next-state gen))
 
 (defn outcome
-  "Return the outcome of a Return value, :return or :throw. Returns that
-  predate `p/outcome` are treated as :return."
+  "Return the outcome kind of a Return value, :return or :throw. Returns
+  created before `p/outcome` existed (which neither satisfy the protocol nor
+  carry the metadata key) are treated as :return. A `p/outcome`
+  implementation that throws is NOT swallowed."
   [ret]
-  (try
+  (if (or (-> ret meta (get `p/outcome))
+          (satisfies? p/Return ret))
     (p/outcome ret)
-    (catch #?(:clj Throwable :cljs :default) _
-      :return)))
+    :return))
 
 (defn ex-spec
   "Returns a spec matching an ex-info whose ex-data conforms to `data-spec`.
@@ -99,13 +96,33 @@
                 (s/gen data-spec)))))
 
 (defn- invoke-outcome
-  "Call f with args, capturing the outcome as data: {:outcome :return
-  :value v} or {:outcome :throw :value exception}."
-  [f & args]
+  "Call (f impl & args), capturing the outcome as data: {:outcome :return
+  :value v} or {:outcome :throw :value exception}. Only Exceptions are
+  captured; Errors (OutOfMemory, StackOverflow, AssertionError, ...) are
+  left to propagate."
+  [f impl args]
   (try
-    {:outcome :return :value (apply f args)}
-    (catch #?(:clj Throwable :cljs :default) t
+    {:outcome :return :value (apply f impl args)}
+    (catch #?(:clj Exception :cljs :default) t
       {:outcome :throw :value t})))
+
+(defn- deliver-outcome
+  "Deliver a captured outcome to a caller: return the value, or throw it
+  when the outcome kind is :throw."
+  [outcome-kind value]
+  (if (= :throw outcome-kind)
+    (throw value)
+    value))
+
+(defn- conforms?
+  "True when an implementation's captured outcome matches the model Return's
+  expected outcome kind and conforms to its spec."
+  [return actual]
+  (boolean
+   (and return
+        (p/spec return)
+        (= (outcome return) (:outcome actual))
+        (s/valid? (p/spec return) (:value actual)))))
 
 (defn return? [x]
   (or (satisfies? p/Return x)
@@ -123,12 +140,12 @@
 
   keywords
   requires - (fn [state] -> bool) if provided, return whether it's valid to call this method in the current state. Defaults to `true`
-  args - (fn [state] -> generator), returns a generator for args to the method. Do not include `this`
+  args - (fn [state] -> generator), returns a generator for args to the method. Do not include `this`. Optional; defaults to a generator of no args.
   precondition - (fn [state args] -> bool). Return truthy if it's valid to call this method with these args in the current state."
   [v f & {:keys [requires precondition args]}]
   (validate! var? v)
   (validate! ifn? f)
-  (validate! ifn? args)
+  (validate! (s/nilable ifn?) args)
   (with-meta {:var v}
     {`p/var (constantly v)
      `p/requires (fn [_ state]
@@ -212,15 +229,14 @@
                                                                          (gen/generate (p/gen ret)))]
                                                          (s/assert ret-spec ret-value)
                                                          ;; HACK
-                                                         (reset! *ret-value {:outcome (outcome ret)
+                                                         (reset! *ret-value {:kind (outcome ret)
                                                                              :value ret-value})
                                                          (p/next-state ret))))
-                         ;; throw outside swap-state: its fn may be retried
-                         ;; and must stay side-effect free
-                         (let [{:keys [outcome value]} @*ret-value]
-                           (if (= :throw outcome)
-                             (throw value)
-                             value))))])))
+                         ;; deliver outside swap-state: its fn may be retried
+                         ;; and must stay side-effect free, so a :throw outcome
+                         ;; must not throw from inside it
+                         (let [{:keys [kind value]} @*ret-value]
+                           (deliver-outcome kind value))))])))
          (into {}))))
 
 (defn model? [x]
@@ -379,21 +395,20 @@
                     (every? (fn [call]
                               (swap! executed-calls conj call)
                               (let [{:keys [method args return]} call
-                                    actual (apply invoke-outcome (p/var method) impl args)
-                                    expected-outcome (outcome return)
-                                    ret (and return
-                                             (p/spec return)
-                                             (s/spec (p/spec return))
-                                             (= expected-outcome (:outcome actual))
-                                             (s/valid? (p/spec return) (:value actual)))]
+                                    actual (invoke-outcome (p/var method) impl args)
+                                    ret (conforms? return actual)]
                                 (when-not ret
-                                  (prn {:fail method
-                                        :args args
-                                        :expected (p/spec return)
-                                        :expected-outcome expected-outcome
-                                        :actual (:value actual)
-                                        :actual-outcome (:outcome actual)
-                                        :explain (s/explain-data (p/spec return) (:value actual))}))
+                                  (prn (merge {:fail method
+                                               :args args
+                                               :expected (p/spec return)
+                                               :expected-outcome (outcome return)
+                                               :actual-outcome (:outcome actual)}
+                                              (if (= :throw (:outcome actual))
+                                                {:actual-exception (:value actual)
+                                                 :actual-message (ex-message (:value actual))
+                                                 :actual-ex-data (ex-data (:value actual))}
+                                                {:actual (:value actual)
+                                                 :explain (s/explain-data (p/spec return) (:value actual))}))))
                                 (swap! executed-calls
                                        (fn [calls call] (-> calls pop (conj call)))
                                        (assoc call
@@ -418,6 +433,7 @@
                  :or {return :implementation
                       mock-state (ephemeral-state)}}]
   (validate! ::model model)
+  (validate! #{:implementation :model} return)
   (let [state (mock-protocol/init-state mock-state (p/initial-state model))]
     (with-meta {}
       (merge
@@ -435,9 +451,17 @@
                                                        (p/next-state ret))))
                             (let [ret-spec (p/spec @*ret)
                                   expected-outcome (outcome @*ret)
-                                  actual (apply invoke-outcome v impl args)]
-                              (when (or (not= expected-outcome (:outcome actual))
-                                        (not (s/valid? ret-spec (:value actual))))
+                                  actual (invoke-outcome v impl args)]
+                              (cond
+                                ;; impl threw where the model did not declare a
+                                ;; throw: propagate the original exception
+                                ;; unchanged, preserving the behavior callers
+                                ;; relied on before fault outcomes existed
+                                (and (= :throw (:outcome actual))
+                                     (not= :throw expected-outcome))
+                                (throw (:value actual))
+
+                                (not (conforms? @*ret actual))
                                 (throw (ex-info
                                         "implementation did not conform to spec" {:model-ret @*ret
                                                                                   :expected-outcome expected-outcome
@@ -445,13 +469,12 @@
                                                                                   :impl-outcome (:outcome actual)
                                                                                   :explain (s/explain-data ret-spec (:value actual))}
                                         (when (= :throw (:outcome actual))
-                                          (:value actual)))))
-                              (if (= :implementation return)
-                                (if (= :throw (:outcome actual))
-                                  (throw (:value actual))
-                                  (:value actual))
-                                (let [model-val (nth (gen/sample (p/gen @*ret)) (rand-int 10))]
-                                  (if (= :throw expected-outcome)
-                                    (throw model-val)
-                                    model-val))))))])))
+                                          (:value actual))))
+
+                                (= :implementation return)
+                                (deliver-outcome (:outcome actual) (:value actual))
+
+                                :else
+                                (deliver-outcome expected-outcome
+                                                 (nth (gen/sample (p/gen @*ret)) (rand-int 10)))))))])))
             (into {}))))))
